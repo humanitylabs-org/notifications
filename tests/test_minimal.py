@@ -42,10 +42,23 @@ class MinimalInboxTests(unittest.TestCase):
     def test_mark_unread_never_wraps(self):
         css = (ROOT/'web/minimal/styles.css').read_text()
         self.assertIn('.act span { max-width: 100%; white-space: nowrap;', css)
-    def test_front_fits_one_exec_argument(self):
-        # Linux refuses any single exec argument over 128 KiB ("argument list too long"): the inlined front is one.
+    def test_front_runs_from_source_with_a_small_start_command(self):
+        # Linux refuses any single exec argument over 128 KiB ("argument list too long"); the front used to be one.
         text = (ROOT/'runtipi/docker-compose.yml').read_text()
-        block = text.split('# BEGIN MCP FRONT', 1)[1].split('# END MCP FRONT', 1)[0].split('\n', 2)[2]
-        self.assertGreater(len(block), 10000)
-        self.assertLess(len(block.encode()), 120 * 1024)   # with indentation, so the real argument is smaller still
+        self.assertNotIn('BEGIN MCP FRONT', text)
+        self.assertLess(len(text.encode()), 20 * 1024)
+        front = text.split('\n  notifications:\n', 1)[1].split('\n  notifications-engine:\n', 1)[0]
+        self.assertIn('    command:\n    - python\n    - /app/mcp/run.py\n', front)
+        self.assertIn('    - ${APP_SOURCE_DIR}:/app:ro\n', front)
+        self.assertIn('  package: source\n', (ROOT/'wizard.md').read_text())
+    def test_runner_loads_every_part(self):
+        ns = {}; exec((ROOT/'mcp/run.py').read_text(), {'__name__': 'runner', '__file__': str(ROOT/'mcp/run.py')}, ns)
+        self.assertEqual(ns['PARTS'], ('front.py', 'tools.py', 'minimal_assets.py', 'relay.py', 'phone.py'))
+        for name in ns['PARTS']:
+            self.assertTrue((ROOT/'mcp'/name).is_file(), name)
+        src = '\n\n'.join((ROOT/'mcp'/n).read_text() for n in ns['PARTS'])
+        env = {'__name__': 'front_test'}; exec(compile(src, 'front', 'exec'), env)
+        for name in ('notify', 'main', 'cron_relay_once', 'ingest_feed', 'MINIMAL_ASSETS'):
+            self.assertIn(name, env)
+        self.assertIn('notify', env['TOOLS'])
 if __name__ == '__main__': unittest.main()

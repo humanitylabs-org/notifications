@@ -1,7 +1,7 @@
 """Wizard MCP front: serves this app's MCP tools at /mcp and passes every other request,
 byte for byte, to the app behind it (HTTP, streaming and WebSockets alike).
 Stdlib only, so it runs on a stock python image with no build step.
-Generated from the app repo's mcp/ folder; edit there, then run mcp/inline.py."""
+Runs from the app's source files (mcp/run.py joins front, tools, assets, relay and phone)."""
 import asyncio
 import contextvars
 import base64

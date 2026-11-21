@@ -6,7 +6,7 @@ A [Wizard app](https://www.aiwizards.com/wizard-apps): install it from the Wizar
 
 - `wizard.md`: what the app is and what it gives the agent (spec: wizard.md v0.2).
 - `runtipi/`: stock Runtipi `config.json` and `docker-compose.yml`. The engine is the official `binwiederhier/ntfy` image, pinned by digest, unchanged.
-- `mcp/`: the app's MCP front (`front.py` + `tools.py`), inlined into the compose file by `python3 mcp/inline.py`. It serves `/mcp` (tools `notify`, `notifications_recent`, `notifications_inbox`, `notifications_mark`, box-only), the inbox at `/notifications/`, the scheduled-job relay (`mcp/relay.py`), and passes everything else unchanged to ntfy.
+- `mcp/`: the app's MCP front (`front.py` + `tools.py`), run from the app's read-only source copy (`runtime.package: source`, `python /app/mcp/run.py`). It serves `/mcp` (tools `notify`, `notifications_recent`, `notifications_inbox`, `notifications_mark`, box-only), the inbox at `/notifications/`, the scheduled-job relay (`mcp/relay.py`), and passes everything else unchanged to ntfy.
 - `SKILL.md`: the skill the agent loads when this app is installed.
 - `.github/workflows/publish.yml`: every push to `main` re-publishes to the index at apps.aiwizards.com.
 
