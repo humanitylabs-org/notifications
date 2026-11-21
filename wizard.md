@@ -10,8 +10,9 @@ version: 2.29.0-wizard29
 summary: Your Wizard's own notification server. The agent tells you when something is done or needs you.
 icon: icon.png
 license: Apache-2.0
-source: https://github.com/oscarhenrycollins/notifications
+source: https://github.com/humanitylabs-org/notifications
 runtime:
+  package: source
   kind: runtipi
   config: runtipi/config.json
   compose: runtipi/docker-compose.yml
