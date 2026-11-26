@@ -297,7 +297,7 @@ def phone_info_route(method, path, query, headers, body):
         out["events"] = [dict(e, id=i) for i, e in out["events"]]
         return _json(200, out)
     if path in (PHONE_INFO, PHONE_INFO + "/") and method == "GET":
-        return _json(200, {"phone": 1, "stream": "api/phone/stream", "events": "api/phone/events"})
+        return _json(200, {"phone": 1, "stream": "api/phone/stream", "events": "api/phone/events", "inbox": "api/phone/inbox"})
     return _json(404, {"error": "not found"})
 
 
@@ -358,6 +358,121 @@ async def phone_stream(reader, writer, method, target, rest):
             _phone_wake.remove(wake)
         if stop in _phone_streams:
             _phone_streams.remove(stop)
+        gone.cancel()
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+# -- push for the phone's own reader (wizard-ux issue 1618) --
+# The Wizard OS Android app reads Notifications' items itself (GET api/items, with its own rules and watermark), every
+# 30 s while it runs and every 15 minutes after that: a locked, dozing phone can see an item up to ~15 minutes late.
+# GET /notifications/api/phone/inbox is a wake-up line for that reader: one Server-Sent Events stream that says
+# `inbox {id, time}` the moment an item is published on an inbox topic (it follows ntfy's own live subscription of
+# those topics), `hello` on connect and after the box lost ntfy for a moment (read now: something may have come in
+# meanwhile), and `: ping` while quiet. It carries no words: the phone reads the item through api/items as before.
+# Same readers as the phone stream: through Tailscale Serve with a user identity, never another app's container.
+PHONE_INBOX = INBOX + "api/phone/inbox"
+PHONE_INBOX_PING_S = float(os.environ.get("PHONE_INBOX_PING_S", "50") or 50)
+PHONE_INBOX_IDLE_S = 150          # ntfy sends a keepalive every 45 s: silence this long means the line is dead
+_inbox_waiters = []               # asyncio.Queue of each open inbox stream
+_inbox_follow = []                # the one task following ntfy while any phone listens
+
+
+def inbox_topics_path():
+    return "/%s/json" % ",".join(urllib.parse.quote(t.strip(), safe="") for t in TOPICS if t.strip())
+
+
+def _inbox_tell(ev):
+    for q in list(_inbox_waiters):
+        if q.qsize() < 32:          # a phone that stopped reading never holds the box's memory
+            q.put_nowait(ev)
+
+
+async def _follow_ntfy():
+    """Follow ntfy's live subscription of the inbox topics and tell every open phone about each new item. Each
+    (re)connection asks ntfy for everything since the last item seen (or since just before the first phone came), so
+    an item published while the box re-connected is still told: at worst a phone reads once more than needed."""
+    delay, since = 1.0, int(time.time()) - 2
+    while _inbox_waiters:
+        w = None
+        try:
+            r, w = await asyncio.wait_for(asyncio.open_connection(up_addr(), UP_PORT), 10)
+            # HTTP/1.0: ntfy answers unchunked, one JSON line per event, until either side closes.
+            w.write(("GET %s?since=%d HTTP/1.0\r\nHost: %s\r\n\r\n" % (inbox_topics_path(), since, UP_HOST)).encode())
+            await w.drain()
+            head = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 15)
+            if b" 200 " not in head.split(b"\r\n", 1)[0] + b" ":
+                raise OSError("ntfy said " + head.split(b"\r\n", 1)[0].decode("latin-1", "replace"))
+            while _inbox_waiters:
+                line = await asyncio.wait_for(r.readline(), PHONE_INBOX_IDLE_S)
+                if not line:
+                    break
+                try:
+                    m = json.loads(line)
+                except ValueError:
+                    continue
+                if m.get("event") == "open":
+                    delay = 1.0
+                elif m.get("event") == "message" and isinstance(m.get("id"), str):
+                    t = m.get("time", 0)
+                    if isinstance(t, (int, float)) and t > since:
+                        since = int(t)
+                    _inbox_tell({"type": "inbox", "id": m["id"][:64], "time": t})
+        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ValueError):
+            pass
+        finally:
+            if w is not None:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+        if _inbox_waiters:
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 30.0)
+    _inbox_follow.clear()
+
+
+@stream(PHONE_INBOX)
+async def phone_inbox_stream(reader, writer, method, target, rest):
+    headers = parse_headers(rest)
+    headers[":peer"] = (writer.get_extra_info("peername") or ("",))[0]
+    if method != "GET":
+        return await respond(writer, 405, {"error": "use GET"})
+    if not await asyncio.to_thread(phone_reader_ok, headers):
+        return await respond(writer, 403, {"error": "open it from the owner's own device"})
+    q = asyncio.Queue()
+    _inbox_waiters.append(q)
+    while len(_inbox_waiters) > PHONE_STREAMS_MAX:      # a phone that reconnects never leaves a ghost behind
+        _inbox_waiters.pop(0).put_nowait(None)
+    if not _inbox_follow or _inbox_follow[0].done():
+        _inbox_follow[:] = [asyncio.ensure_future(_follow_ntfy())]
+    gone = asyncio.ensure_future(reader.read(1))        # the phone hung up
+    try:
+        writer.write(("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-store\r\n"
+                      "X-Accel-Buffering: no\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\nretry: 5000\n\n").encode())
+        writer.write(_sse(None, {"type": "hello", "v": 1}))
+        await writer.drain()
+        while not gone.done():
+            get = asyncio.ensure_future(q.get())
+            done, _ = await asyncio.wait([get, gone], timeout=PHONE_INBOX_PING_S, return_when=asyncio.FIRST_COMPLETED)
+            if get not in done:
+                get.cancel()
+                if not done:
+                    writer.write(b": ping\n\n")
+                    await writer.drain()
+                continue
+            ev = get.result()
+            if ev is None:                              # replaced by a newer stream
+                break
+            writer.write(_sse(None, ev))
+            await writer.drain()
+    except (ConnectionError, OSError):
+        pass
+    finally:
+        if q in _inbox_waiters:
+            _inbox_waiters.remove(q)
         gone.cancel()
         try:
             writer.close()
