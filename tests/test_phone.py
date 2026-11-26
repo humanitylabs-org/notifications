@@ -286,5 +286,119 @@ class StreamTests(unittest.TestCase):
         c.close()
 
 
+class FakeNtfy:
+    """A stand-in for ntfy's live subscription: GET /<topics>/json streams one JSON line per event until closed."""
+
+    def __init__(self):
+        self.srv = socket.socket(); self.srv.bind(("127.0.0.1", 0)); self.srv.listen(8)
+        self.port = self.srv.getsockname()[1]
+        self.subs, self.paths = [], []
+        threading.Thread(target=self.accept, daemon=True).start()
+
+    def accept(self):
+        while True:
+            try:
+                s, _ = self.srv.accept()
+            except OSError:
+                return
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += s.recv(4096)
+            self.paths.append(data.split(b" ")[1].decode())
+            s.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: application/x-ndjson\r\n\r\n" + json.dumps({"event": "open"}).encode() + b"\n")
+            self.subs.append(s)
+
+    def publish(self, mid, t=1795000000, topic="wizard"):
+        line = json.dumps({"id": mid, "time": t, "event": "message", "topic": topic, "message": "x"}).encode() + b"\n"
+        for s in list(self.subs):
+            try:
+                s.sendall(line)
+            except OSError:
+                self.subs.remove(s)
+
+    def drop(self):
+        for s in self.subs:
+            s.close()
+        self.subs.clear()
+
+
+class InboxPushTests(StreamTests):
+    """wizard-ux issue 1618: the phone's wake-up line. A new Notifications item (any inbox topic) is told at once."""
+
+    def setUp(self):
+        self.ntfy = FakeNtfy()
+        os.environ.update({"UPSTREAM_HOST": "127.0.0.1", "UPSTREAM_PORT": str(self.ntfy.port), "INBOX_TOPICS": "wizard,cron"})
+        try:
+            super().setUp()
+        finally:
+            for k in ("UPSTREAM_HOST", "UPSTREAM_PORT", "INBOX_TOPICS"):
+                os.environ.pop(k, None)
+
+    def open(self, query="", login="miguel@askmiguel.ai"):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/notifications/api/phone/inbox" + query, headers={"Tailscale-User-Login": login} if login else {})
+        return c, c.getresponse()
+
+    def wait_subscribed(self, n=1):
+        for _ in range(100):
+            if len(self.ntfy.subs) >= n:
+                return
+            time.sleep(0.02)
+        self.fail("the box never followed ntfy")
+
+    def test_new_item_is_told_at_once_and_carries_no_words(self):
+        c, r = self.open()
+        self.assertEqual(r.status, 200)
+        self.assertTrue(r.getheader("Content-Type").startswith("text/event-stream"))
+        self.assertEqual(self.read_event(r)["event"], "hello", "the phone reads once on connect")
+        self.wait_subscribed()
+        self.assertTrue(self.ntfy.paths[0].startswith("/wizard,cron/json?since="), self.ntfy.paths)
+        t0 = time.time()
+        self.ntfy.publish("item1")
+        ev = self.read_event(r)
+        self.assertLess(time.time() - t0, 1.0, "instant, not a poll")
+        self.assertEqual(ev["event"], "inbox")
+        self.assertEqual(json.loads(ev["data"]), {"type": "inbox", "id": "item1", "time": 1795000000})
+        self.ntfy.publish("item2", topic="cron")
+        self.assertEqual(json.loads(self.read_event(r)["data"])["id"], "item2", "scheduled-job results too")
+        c.close()
+
+    def test_box_losing_ntfy_reconnects_from_the_last_item(self):
+        c, r = self.open()
+        self.read_event(r)
+        self.wait_subscribed()
+        t = int(time.time()) + 100
+        self.ntfy.publish("a", t=t)
+        self.read_event(r)
+        self.ntfy.drop()
+        self.wait_subscribed()
+        self.assertIn("since=%d" % t, self.ntfy.paths[-1], "asks for what came in while it was away")
+        self.ntfy.publish("b", t=t + 1)
+        self.assertEqual(json.loads(self.read_event(r)["data"])["id"], "b")
+        c.close()
+
+    def test_idle_stream_pings_and_strangers_are_refused(self):
+        self.ns["PHONE_INBOX_PING_S"] = 0.3
+        c, r = self.open()
+        self.read_event(r)
+        self.assertEqual(r.fp.readline(), b": ping\n", "keeps the connection alive")
+        c.close()
+        c, r = self.open(login="")
+        self.assertEqual(r.status, 403, "no tailnet identity: refused")
+        c.close()
+        self.ns["peer_name"] = lambda ip: "messenger.wizard-link-messenger--notifications"
+        c, r = self.open()
+        self.assertEqual(r.status, 403, "another app's container may never listen")
+        c.close()
+
+    def test_phone_info_names_the_inbox_stream(self):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("GET", "/notifications/api/phone")
+        self.assertEqual(json.loads(c.getresponse().read())["inbox"], "api/phone/inbox")
+        c.close()
+
+    test_live_event_then_reconnect_replays_what_was_missed = None
+
+
 if __name__ == "__main__":
     unittest.main()

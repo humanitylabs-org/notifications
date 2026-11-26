@@ -60,5 +60,24 @@ GET /notifications/api/phone/events?since=<last id>&sid=<server id>      (same c
   Set `PHONE_OWNER_LOGIN` to accept only the owner's login.
 - Store: `/data/phone.sqlite3` (events, current Chats items, Badge counts).
 
+## For the phone's own reader: a wake-up line
+
+The Android app also reads Notifications' items itself (`GET /notifications/api/items`, per-app channels, its own
+rules and watermark; wizard-ux issue 1567). On its own it reads every 30 s while it runs and every 15 minutes after
+that, so a locked, dozing phone could see an item late. With the phone switch `wizard/phone-push` on, it keeps one
+more connection open (wizard-ux issue 1618):
+
+```
+GET /notifications/api/phone/inbox        (text/event-stream)
+event: hello   data: {"type":"hello","v":1}                         read once now
+event: inbox   data: {"type":"inbox","id":"<item id>","time":<s>}   a new item: read once now
+: ping                                                               every 50 s while quiet (PHONE_INBOX_PING_S)
+```
+
+- It follows ntfy's own live subscription of the inbox topics (`INBOX_TOPICS`), so an item is told the moment it is
+  published; after the box loses ntfy for a moment it asks ntfy for everything since the last item it saw.
+- It carries no words: the phone reads the item through `api/items` as before, so Off and quiet items stay off it.
+- Same readers as the phone stream: through Tailscale Serve with a user identity, never another app's container.
+
 Tests: `python -m unittest tests.test_phone` (diff rules, routes, catch-up, sender/reader identity, the real SSE
 endpoint on a socket).
